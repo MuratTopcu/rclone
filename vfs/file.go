@@ -274,7 +274,16 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
 		}
 		// Rename in the cache
 		if d.vfs.cache != nil && d.vfs.cache.Exists(oldPath) {
-			if err := d.vfs.cache.Rename(oldPath, newPath, newObject); err != nil {
+			// Editors save by renaming a new file over the original,
+			// so with --vfs-conflict-copy writeback compares the
+			// remote with the file as the VFS saw it
+			var replaced fs.Object
+			if o == nil && d.vfs.Opt.ConflictCopy {
+				if dst, ok := d.cachedNode(newName).(*File); ok && dst != f {
+					replaced = dst.getObject()
+				}
+			}
+			if err := d.vfs.cache.Rename(oldPath, newPath, newObject, replaced); err != nil {
 				fs.Infof(f.Path(), "File.Rename failed in Cache: %v", err)
 			}
 		}
@@ -460,6 +469,14 @@ func (f *File) SetModTime(modTime time.Time) error {
 	// set the time of the file in the cache
 	if f.d.vfs.cache != nil && f.d.vfs.cache.Exists(f._cachePath()) {
 		f.d.vfs.cache.SetModTime(f._cachePath(), f.pendingModTime)
+	}
+
+	// With --vfs-conflict-copy the writeback compares the remote with
+	// the fingerprint taken when the file was cached, so leave the remote
+	// alone while a writeback is pending. The upload carries the new time
+	// and setObject applies it.
+	if f.d.vfs.Opt.ConflictCopy && f.d.vfs.cache != nil && f.d.vfs.cache.DirtyItem(f._cachePath()) != nil {
+		return nil
 	}
 
 	// Only update the ModTime when there are no writers, setObject will do it

@@ -15,6 +15,7 @@ import (
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/lib/file"
 	"github.com/rclone/rclone/lib/ranges"
+	"github.com/rclone/rclone/lib/transform"
 	"github.com/rclone/rclone/vfs/vfscache/downloaders"
 	"github.com/rclone/rclone/vfs/vfscache/writeback"
 	"github.com/rclone/rclone/vfs/vfscommon"
@@ -628,6 +629,64 @@ func unlockMutexForCall(mu *sync.Mutex, f func()) {
 	f()
 }
 
+// backupConflict moves the remote object aside if it changed since it was
+// cached, so a pending local modification does not silently overwrite it.
+//
+// It returns the remote object the writeback should overwrite, or nil if
+// there is none because the remote doesn't exist or has just been moved
+// aside.
+func (c *Cache) backupConflict(ctx context.Context, name, fingerprint string) (fs.Object, error) {
+	remote, err := c.fremote.NewObject(ctx, name)
+	if errors.Is(err, fs.ErrorObjectNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("vfs cache: failed to check remote before writeback: %w", err)
+	}
+	if fs.Fingerprint(ctx, remote, c.opt.FastFingerprint) == fingerprint {
+		return remote, nil
+	}
+	ctx, backupDir, err := c.conflictBackupDir(ctx, name)
+	if err == nil {
+		err = numberConflictCopy(ctx, backupDir, name)
+	}
+	if err == nil {
+		err = operations.MoveBackupDir(ctx, backupDir, remote)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("vfs cache: failed to keep conflict copy: %w", err)
+	}
+	fs.Logf(name, "vfs cache: remote changed while modified locally - kept the remote version as %q", operations.SuffixName(ctx, name))
+	return nil, nil
+}
+
+// numberConflictCopy adds a number to the suffix in ctx if needed so the
+// conflict copy of name doesn't overwrite a file in backupDir.
+func numberConflictCopy(ctx context.Context, backupDir fs.Fs, name string) error {
+	ci := fs.GetConfig(ctx)
+	suffix := ci.Suffix
+	for i := 1; ; i++ {
+		_, err := backupDir.NewObject(ctx, operations.SuffixName(ctx, name))
+		if errors.Is(err, fs.ErrorObjectNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		ci.Suffix = fmt.Sprintf("%s-%d", suffix, i)
+	}
+}
+
+// conflictBackupDir returns the directory the conflict copy of name is
+// moved into, which is --backup-dir if set, and a context whose suffix is
+// --vfs-conflict-suffix with its time globs expanded.
+func (c *Cache) conflictBackupDir(ctx context.Context, name string) (context.Context, fs.Fs, error) {
+	ctx, ci := fs.AddConfig(ctx)
+	ci.Suffix = transform.AppyTimeGlobs(c.opt.ConflictSuffix, time.Now())
+	backupDir, err := operations.BackupDir(ctx, c.fremote, c.fremote, name)
+	return ctx, backupDir, err
+}
+
 // Store stores the local cache file to the remote object, returning
 // the new remote object. objOld is the old object if known.
 //
@@ -644,7 +703,14 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 	// Object has disappeared if cacheObj == nil
 	if cacheObj != nil {
 		o, name := item.o, item.name
+		fingerprint := item.info.Fingerprint
 		unlockMutexForCall(&item.mu, func() {
+			if item.c.opt.ConflictCopy {
+				o, err = item.c.backupConflict(ctx, name, fingerprint)
+				if err != nil {
+					return
+				}
+			}
 			o, err = operations.Copy(ctx, item.c.fremote, o, name, cacheObj)
 		})
 		if err != nil {
@@ -918,7 +984,7 @@ func (item *Item) _checkObject(o fs.Object) error {
 					fs.Debugf(item.name, "vfs cache: remote object has changed but local object modified - keeping it (remote fingerprint %q != cached fingerprint %q)", remoteFingerprint, item.info.Fingerprint)
 				}
 			}
-		} else {
+		} else if !item._keepFingerprint() {
 			// remote object && no local object
 			// Set fingerprint
 			item.info.Fingerprint = remoteFingerprint
@@ -1321,6 +1387,15 @@ func (item *Item) _updateFingerprint() {
 	}
 }
 
+// _keepFingerprint returns true if the fingerprint must only change when
+// the item is uploaded, because --vfs-conflict-copy compares it with the
+// remote to find changes made while the item is dirty.
+//
+// Call with the lock held
+func (item *Item) _keepFingerprint() bool {
+	return item.c.opt.ConflictCopy && item.info.Dirty
+}
+
 // setModTime of the cache file
 //
 // call with lock held
@@ -1337,7 +1412,9 @@ func (item *Item) _setModTime(modTime time.Time) {
 func (item *Item) setModTime(modTime time.Time) {
 	// defer log.Trace(item.name, "modTime=%v", modTime)("")
 	item.mu.Lock()
-	item._updateFingerprint()
+	if !item._keepFingerprint() {
+		item._updateFingerprint()
+	}
 	item._setModTime(modTime)
 	item.info.ModTime = modTime
 	err := item._save()
@@ -1534,7 +1611,9 @@ func (item *Item) Sync() (err error) {
 }
 
 // rename the item
-func (item *Item) rename(name string, newName string, newObj fs.Object) (err error) {
+//
+// If fingerprint is set the item replaces a file with that fingerprint.
+func (item *Item) rename(name string, newName string, newObj fs.Object, fingerprint string) (err error) {
 	item.preAccess()
 	defer item.postAccess()
 	item.mu.Lock()
@@ -1549,7 +1628,11 @@ func (item *Item) rename(name string, newName string, newObj fs.Object) (err err
 	// Set internal state
 	item.name = newName
 	item.o = newObj
-	item._updateFingerprint()
+	if fingerprint != "" {
+		item.info.Fingerprint = fingerprint
+	} else if !item._keepFingerprint() {
+		item._updateFingerprint()
+	}
 
 	// Rename cache file if it exists
 	err = rename(item.c.toOSPath(name), item.c.toOSPath(newName)) // No locking in Cache
@@ -1558,6 +1641,14 @@ func (item *Item) rename(name string, newName string, newObj fs.Object) (err err
 	err2 := rename(item.c.toOSPathMeta(name), item.c.toOSPathMeta(newName)) // No locking in Cache
 	if err2 != nil {
 		err = err2
+	}
+
+	// Keep the fingerprint of the replaced file over a restart
+	if fingerprint != "" {
+		err2 = item._save()
+		if err2 != nil {
+			err = err2
+		}
 	}
 
 	item.mu.Unlock()

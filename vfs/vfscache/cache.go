@@ -132,6 +132,15 @@ func New(ctx context.Context, fremote fs.Fs, opt *vfscommon.Options, avFn AddVir
 		avFn:       avFn,
 	}
 
+	// Check --vfs-conflict-copy can work now rather than failing
+	// writebacks at the first conflict
+	if opt.ConflictCopy {
+		if err := c.checkConflictCopy(ctx); err != nil {
+			fs.Errorf(nil, "vfs cache: disabling --vfs-conflict-copy: %v", err)
+			opt.ConflictCopy = false
+		}
+	}
+
 	// load in the cache and metadata off disk
 	err = c.reload(ctx)
 	if err != nil {
@@ -418,9 +427,16 @@ func rename(osOldPath, osNewPath string) error {
 }
 
 // Rename the item in cache
-func (c *Cache) Rename(name string, newName string, newObj fs.Object) (err error) {
+//
+// replaced is the object of the file called newName which the item
+// replaces, if any.
+func (c *Cache) Rename(name string, newName string, newObj, replaced fs.Object) (err error) {
 	item, _ := c.get(name)
-	err = item.rename(name, newName, newObj)
+	var fingerprint string
+	if c.opt.ConflictCopy && replaced != nil {
+		fingerprint = c.replacedFingerprint(newName, replaced)
+	}
+	err = item.rename(name, newName, newObj, fingerprint)
 	if err != nil {
 		return err
 	}
@@ -435,6 +451,37 @@ func (c *Cache) Rename(name string, newName string, newObj fs.Object) (err error
 
 	fs.Infof(name, "vfs cache: renamed in cache to %q", newName)
 	return nil
+}
+
+// replacedFingerprint returns the fingerprint --vfs-conflict-copy compares
+// the remote with for an item replacing the file called name whose object
+// is o: the fingerprint the file was modified from if it is dirty, else
+// the fingerprint of o.
+func (c *Cache) replacedFingerprint(name string, o fs.Object) string {
+	c.mu.Lock()
+	item := c.item[name]
+	c.mu.Unlock()
+	if item != nil {
+		item.mu.Lock()
+		dirty, fingerprint := item.info.Dirty, item.info.Fingerprint
+		item.mu.Unlock()
+		if dirty {
+			return fingerprint
+		}
+	}
+	return fs.Fingerprint(c.ctx, o, c.opt.FastFingerprint)
+}
+
+// checkConflictCopy returns an error if --vfs-conflict-copy can't work
+// with this remote and options.
+func (c *Cache) checkConflictCopy(ctx context.Context) error {
+	if c.opt.ConflictSuffix == "" || strings.Contains(c.opt.ConflictSuffix, "/") {
+		return fmt.Errorf("invalid --vfs-conflict-suffix %q", c.opt.ConflictSuffix)
+	}
+	// Any file name will do as it only chooses the checks made for a
+	// single file
+	_, _, err := c.conflictBackupDir(ctx, "file")
+	return err
 }
 
 // DirExists checks to see if the directory exists in the cache or not.
@@ -467,7 +514,7 @@ func (c *Cache) DirRename(oldDirName string, newDirName string) (err error) {
 	// Rename the items
 	for _, itemName := range renames {
 		newPath := newDirName + itemName[len(oldDirName):]
-		renameErr := c.Rename(itemName, newPath, nil)
+		renameErr := c.Rename(itemName, newPath, nil, nil)
 		if renameErr != nil {
 			err = renameErr
 		}

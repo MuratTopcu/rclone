@@ -8,11 +8,13 @@ import (
 	"io"
 	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/lib/random"
 	"github.com/rclone/rclone/lib/ranges"
@@ -822,4 +824,335 @@ func TestItemHandleCachingReopenDuringGraceClose(t *testing.T) {
 		item.graceTimer.Stop()
 	}
 	item.mu.Unlock()
+}
+
+// newConflictTestCache makes a cache for item tests with
+// --vfs-conflict-copy set, skipping the test if the remote can't keep
+// conflict copies.
+func newConflictTestCache(t *testing.T) (r *fstest.Run, c *Cache) {
+	r, c = newItemTestCache(t)
+	if !operations.CanServerSideMove(r.Fremote) {
+		t.Skip("can't keep conflict copies without server-side move")
+	}
+	c.opt.ConflictCopy = true
+	return r, c
+}
+
+// conflictCopies returns the objects in the root of the remote whose
+// names start with remote, excluding remote itself.
+func conflictCopies(t *testing.T, r *fstest.Run, remote string) (copies []fs.Object) {
+	entries, err := r.Fremote.List(context.Background(), "")
+	require.NoError(t, err)
+	entries.ForObject(func(o fs.Object) {
+		if o.Remote() != remote && strings.HasPrefix(o.Remote(), remote) {
+			copies = append(copies, o)
+		}
+	})
+	return copies
+}
+
+// TestItemConflictCopyPreservesRemote checks that when the remote object
+// has changed while a local modification is pending, writeback with
+// ConflictCopy set uploads the local data under the original name and
+// keeps the remote data as a conflict copy, so nothing is lost.
+func TestItemConflictCopyPreservesRemote(t *testing.T) {
+	r, c := newConflictTestCache(t)
+
+	// Remote object cached locally
+	_, obj, item := newFile(t, r, c, "existing")
+	require.NoError(t, item.Open(obj))
+	localContents := random.String(120)
+	n, err := item.WriteAt([]byte(localContents), 0)
+	require.NoError(t, err)
+	assert.Equal(t, 120, n)
+	assert.True(t, item.IsDirty())
+
+	// Another client changes the remote object before writeback
+	remoteContents := random.String(80)
+	r.WriteObject(context.Background(), "existing", remoteContents, time.Now())
+
+	// Writeback: local data wins the name, remote data is kept as a copy
+	require.NoError(t, item.Close(nil))
+	checkObject(t, r, "existing", localContents)
+
+	copies := conflictCopies(t, r, "existing")
+	require.Len(t, copies, 1, "expected exactly one conflict copy")
+	assert.Regexp(t, `^existing\.conflict-\d{8}-\d{6}$`, copies[0].Remote())
+	checkObject(t, r, copies[0].Remote(), remoteContents)
+}
+
+// TestItemConflictCopyUnchangedRemote checks that ConflictCopy leaves a
+// plain writeback alone when the remote has not changed.
+func TestItemConflictCopyUnchangedRemote(t *testing.T) {
+	r, c := newConflictTestCache(t)
+
+	_, obj, item := newFile(t, r, c, "existing")
+	require.NoError(t, item.Open(obj))
+	localContents := random.String(120)
+	_, err := item.WriteAt([]byte(localContents), 0)
+	require.NoError(t, err)
+	require.NoError(t, item.Close(nil))
+
+	checkObject(t, r, "existing", localContents)
+	assert.Empty(t, conflictCopies(t, r, "existing"))
+}
+
+// TestItemConflictCopySuffix checks that the conflict copy is named with
+// --vfs-conflict-suffix rather than --suffix, honouring
+// --suffix-keep-extension.
+func TestItemConflictCopySuffix(t *testing.T) {
+	ci := fs.GetConfig(context.Background())
+	oldSuffix, oldKeep := ci.Suffix, ci.SuffixKeepExtension
+	ci.Suffix, ci.SuffixKeepExtension = "-old", true
+	t.Cleanup(func() { ci.Suffix, ci.SuffixKeepExtension = oldSuffix, oldKeep })
+
+	r, c := newConflictTestCache(t)
+	c.opt.ConflictSuffix = "-conflict"
+
+	_, obj, item := newFile(t, r, c, "existing.txt")
+	require.NoError(t, item.Open(obj))
+	localContents := random.String(120)
+	_, err := item.WriteAt([]byte(localContents), 0)
+	require.NoError(t, err)
+	remoteContents := random.String(80)
+	r.WriteObject(context.Background(), "existing.txt", remoteContents, time.Now())
+	require.NoError(t, item.Close(nil))
+
+	checkObject(t, r, "existing.txt", localContents)
+	checkObject(t, r, "existing-conflict.txt", remoteContents)
+}
+
+// TestItemConflictCopyTimeGlobs checks that --vfs-conflict-suffix
+// expands time globs like bisync's --conflict-suffix does.
+func TestItemConflictCopyTimeGlobs(t *testing.T) {
+	r, c := newConflictTestCache(t)
+	c.opt.ConflictSuffix = ".conflict-{YYYYMMDD}"
+
+	_, obj, item := newFile(t, r, c, "existing")
+	require.NoError(t, item.Open(obj))
+	_, err := item.WriteAt([]byte(random.String(120)), 0)
+	require.NoError(t, err)
+	remoteContents := random.String(80)
+	r.WriteObject(context.Background(), "existing", remoteContents, time.Now())
+	before := time.Now()
+	require.NoError(t, item.Close(nil))
+
+	copies := conflictCopies(t, r, "existing")
+	require.Len(t, copies, 1, "expected exactly one conflict copy")
+	// The date may change during the writeback
+	assert.Contains(t, []string{
+		"existing.conflict-" + before.Format("20060102"),
+		"existing.conflict-" + time.Now().Format("20060102"),
+	}, copies[0].Remote())
+	checkObject(t, r, copies[0].Remote(), remoteContents)
+}
+
+// TestItemConflictCopyBackupDir checks that the conflict copy is moved
+// into --backup-dir when it is set.
+func TestItemConflictCopyBackupDir(t *testing.T) {
+	r, c := newConflictTestCache(t)
+	c.opt.ConflictSuffix = "-conflict"
+	ci := fs.GetConfig(context.Background())
+	oldBackupDir := ci.BackupDir
+	ci.BackupDir = r.FremoteName + "/backup"
+	t.Cleanup(func() { ci.BackupDir = oldBackupDir })
+
+	_, obj, item := newFile(t, r, c, "existing")
+	require.NoError(t, item.Open(obj))
+	localContents := random.String(120)
+	_, err := item.WriteAt([]byte(localContents), 0)
+	require.NoError(t, err)
+	remoteContents := random.String(80)
+	r.WriteObject(context.Background(), "existing", remoteContents, time.Now())
+	require.NoError(t, item.Close(nil))
+
+	checkObject(t, r, "existing", localContents)
+	checkObject(t, r, "backup/existing-conflict", remoteContents)
+}
+
+// TestItemConflictCopyNumbered checks that a conflict copy doesn't
+// overwrite an earlier one with the same name.
+func TestItemConflictCopyNumbered(t *testing.T) {
+	r, c := newConflictTestCache(t)
+	c.opt.ConflictSuffix = "-conflict"
+	ctx := context.Background()
+
+	_, obj, item := newFile(t, r, c, "existing")
+	var remoteContents []string
+	for i := range 2 {
+		require.NoError(t, item.Open(obj))
+		_, err := item.WriteAt([]byte(random.String(120)), 0)
+		require.NoError(t, err)
+		contents := random.String(80 + i)
+		r.WriteObject(ctx, "existing", contents, time.Now().Add(time.Duration(i)*time.Minute))
+		remoteContents = append(remoteContents, contents)
+		require.NoError(t, item.Close(nil))
+		obj, err = r.Fremote.NewObject(ctx, "existing")
+		require.NoError(t, err)
+	}
+
+	checkObject(t, r, "existing-conflict", remoteContents[0])
+	checkObject(t, r, "existing-conflict-1", remoteContents[1])
+}
+
+// TestItemConflictCopyDirRename checks that a remote change to a dirty
+// file is still found after its directory is renamed.
+func TestItemConflictCopyDirRename(t *testing.T) {
+	r, c := newConflictTestCache(t)
+	ctx := context.Background()
+
+	_, obj, item := newFile(t, r, c, "dir/existing")
+	require.NoError(t, item.Open(obj))
+	localContents := random.String(120)
+	_, err := item.WriteAt([]byte(localContents), 0)
+	require.NoError(t, err)
+	remoteContents := random.String(80)
+	r.WriteObject(ctx, "dir/existing", remoteContents, time.Now())
+
+	require.NoError(t, operations.DirMove(ctx, r.Fremote, "dir", "dir2"))
+	require.NoError(t, c.DirRename("dir", "dir2"))
+	require.NoError(t, item.Close(nil))
+
+	checkObject(t, r, "dir2/existing", localContents)
+	entries, err := r.Fremote.List(ctx, "dir2")
+	require.NoError(t, err)
+	assert.Len(t, entries, 2, "expected a conflict copy in %v", entries)
+}
+
+// TestItemConflictCopyRenameOverRestart checks that a new file renamed
+// over an existing one is compared with the file it replaced when it is
+// written back after a restart.
+func TestItemConflictCopyRenameOverRestart(t *testing.T) {
+	r, c := newConflictTestCache(t)
+	ctx := context.Background()
+
+	r.WriteObject(ctx, "existing", random.String(80), time.Now())
+	replaced, err := r.Fremote.NewObject(ctx, "existing")
+	require.NoError(t, err)
+
+	item, _ := c.get("existing.tmp")
+	require.NoError(t, item.Open(nil))
+	localContents := random.String(120)
+	_, err = item.WriteAt([]byte(localContents), 0)
+	require.NoError(t, err)
+
+	// Close the file to pacify Windows, but don't call item.Close()
+	item.mu.Lock()
+	require.NoError(t, item.fd.Close())
+	item.fd = nil
+	item.mu.Unlock()
+
+	require.NoError(t, c.Rename("existing.tmp", "existing", nil, replaced))
+
+	// Remove the item from the cache and reload it as after a restart
+	c.mu.Lock()
+	delete(c.item, "existing")
+	c.mu.Unlock()
+	item2, _ := c._get("existing")
+	require.NoError(t, item2.reload(ctx))
+
+	checkObject(t, r, "existing", localContents)
+	assert.Empty(t, conflictCopies(t, r, "existing"))
+}
+
+// TestItemConflictCopyRetry checks that when the remote object has been
+// moved aside but the upload then failed, the retried writeback uploads
+// the local data without making a second conflict copy.
+func TestItemConflictCopyRetry(t *testing.T) {
+	r, c := newConflictTestCache(t)
+	ctx := context.Background()
+
+	_, obj, item := newFile(t, r, c, "existing")
+	require.NoError(t, item.Open(obj))
+	localContents := random.String(120)
+	_, err := item.WriteAt([]byte(localContents), 0)
+	require.NoError(t, err)
+	remoteContents := random.String(80)
+	r.WriteObject(ctx, "existing", remoteContents, time.Now())
+
+	// First writeback attempt: the remote is moved aside, then the
+	// upload fails, leaving the item dirty with its old fingerprint.
+	item.mu.Lock()
+	fingerprint := item.info.Fingerprint
+	item.mu.Unlock()
+	o, err := c.backupConflict(ctx, "existing", fingerprint)
+	require.NoError(t, err)
+	assert.Nil(t, o)
+	_, err = r.Fremote.NewObject(ctx, "existing")
+	require.ErrorIs(t, err, fs.ErrorObjectNotFound)
+	assert.True(t, item.IsDirty())
+
+	// Retried writeback
+	require.NoError(t, item.Close(nil))
+	checkObject(t, r, "existing", localContents)
+
+	copies := conflictCopies(t, r, "existing")
+	require.Len(t, copies, 1, "expected exactly one conflict copy")
+	checkObject(t, r, copies[0].Remote(), remoteContents)
+}
+
+// TestItemConflictCopyReopen checks that the remote is still seen as
+// changed after the dirty item is opened again with the changed remote
+// object and its modification time is set.
+func TestItemConflictCopyReopen(t *testing.T) {
+	r, c := newConflictTestCache(t)
+	ctx := context.Background()
+
+	_, obj, item := newFile(t, r, c, "existing")
+	require.NoError(t, item.Open(obj))
+	localContents := random.String(120)
+	_, err := item.WriteAt([]byte(localContents), 0)
+	require.NoError(t, err)
+	remoteContents := random.String(80)
+	r.WriteObject(ctx, "existing", remoteContents, time.Now())
+
+	newObj, err := r.Fremote.NewObject(ctx, "existing")
+	require.NoError(t, err)
+	require.NoError(t, item.Open(newObj))
+	item.setModTime(time.Now())
+	require.NoError(t, item.Close(nil))
+	require.NoError(t, item.Close(nil))
+
+	checkObject(t, r, "existing", localContents)
+	copies := conflictCopies(t, r, "existing")
+	require.Len(t, copies, 1, "expected exactly one conflict copy")
+	checkObject(t, r, copies[0].Remote(), remoteContents)
+}
+
+// TestItemConflictCopyReload checks that a new file which was never
+// uploaded doesn't overwrite a remote file of the same name made in the
+// meantime when it is written back after a restart.
+func TestItemConflictCopyReload(t *testing.T) {
+	r, c := newConflictTestCache(t)
+	ctx := context.Background()
+
+	item, _ := c.get("new")
+	require.NoError(t, item.Open(nil))
+	localContents := random.String(120)
+	_, err := item.WriteAt([]byte(localContents), 0)
+	require.NoError(t, err)
+
+	// Close the file to pacify Windows, but don't call item.Close()
+	item.mu.Lock()
+	require.NoError(t, item.fd.Close())
+	item.fd = nil
+	item.mu.Unlock()
+
+	// Remove the item from the cache
+	c.mu.Lock()
+	delete(c.item, item.name)
+	c.mu.Unlock()
+
+	// Another client makes a file with the same name
+	remoteContents := random.String(80)
+	r.WriteObject(ctx, "new", remoteContents, time.Now())
+
+	// Reload the item which writes it back
+	item2, _ := c._get("new")
+	require.NoError(t, item2.reload(ctx))
+
+	checkObject(t, r, "new", localContents)
+	copies := conflictCopies(t, r, "new")
+	require.Len(t, copies, 1, "expected exactly one conflict copy")
+	checkObject(t, r, copies[0].Remote(), remoteContents)
 }

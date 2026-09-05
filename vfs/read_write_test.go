@@ -684,6 +684,52 @@ func TestRWFileModTimeWithOpenWriters(t *testing.T) {
 	r.CheckRemoteItems(t, file1)
 }
 
+// TestRWConflictCopySetModTime checks that setting the modification time
+// of a file after writing it but before it is written back, as `cp -p`
+// and `touch` do, is not mistaken for a remote change by
+// --vfs-conflict-copy.
+func TestRWConflictCopySetModTime(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CacheMode = vfscommon.CacheModeWrites
+	opt.WriteBack = fs.Duration(time.Second)
+	opt.ConflictCopy = true
+	r, vfs := newTestVFSOpt(t, &opt)
+	if !canSetModTime(t, r) {
+		t.Skip("can't set mod time")
+	}
+
+	file1 := r.WriteObject(context.Background(), "file1", "0123456789abcdef", t1)
+	r.CheckRemoteItems(t, file1)
+
+	require.NoError(t, vfs.WriteFile("file1", []byte("hello"), 0777))
+	mtime := time.Date(2012, time.November, 18, 17, 32, 31, 0, time.UTC)
+	require.NoError(t, vfs.Chtimes("file1", mtime, mtime))
+
+	vfs.WaitForWriters(waitForWritersDelay)
+	r.CheckRemoteItems(t, fstest.NewItem("file1", "hello", mtime))
+}
+
+// TestRWConflictCopyRewrite checks that writing a file back twice with no
+// remote change in between makes no conflict copy, so the object an
+// upload returns matches the remote as seen afterwards.
+func TestRWConflictCopyRewrite(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CacheMode = vfscommon.CacheModeWrites
+	opt.WriteBack = writeBackDelay
+	opt.ConflictCopy = true
+	r, vfs := newTestVFSOpt(t, &opt)
+
+	for _, contents := range []string{"hello", "hello again"} {
+		require.NoError(t, vfs.WriteFile("file1", []byte(contents), 0777))
+		vfs.WaitForWriters(waitForWritersDelay)
+	}
+
+	entries, err := r.Fremote.List(context.Background(), "")
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "unexpected entries %v", entries)
+	assert.Equal(t, int64(11), entries[0].Size())
+}
+
 func TestRWCacheRename(t *testing.T) {
 	opt := vfscommon.Opt
 	opt.CacheMode = vfscommon.CacheModeFull
@@ -757,5 +803,46 @@ func TestRWCacheUpdate(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, int64(len(contents)), fi.Size())
 		fstest.AssertTimeEqualWithPrecision(t, filename, modTime, fi.ModTime(), r.Fremote.Precision())
+	}
+}
+
+// TestRWConflictCopyRenameOver checks that a file saved by writing a new
+// file and renaming it over the original, as many editors do, is
+// compared with the original as the VFS saw it by --vfs-conflict-copy.
+func TestRWConflictCopyRenameOver(t *testing.T) {
+	for _, changed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("changed=%v", changed), func(t *testing.T) {
+			opt := vfscommon.Opt
+			opt.CacheMode = vfscommon.CacheModeWrites
+			opt.WriteBack = fs.Duration(time.Second)
+			opt.ConflictCopy = true
+			r, vfs := newTestVFSOpt(t, &opt)
+			ctx := context.Background()
+
+			r.WriteObject(ctx, "file1", "0123456789abcdef", t1)
+			_, err := vfs.Stat("file1")
+			require.NoError(t, err)
+			want := 1
+			if changed {
+				// Another client changes the file after the VFS saw it
+				r.WriteObject(ctx, "file1", "changed by another client", t2)
+				want = 2
+			}
+
+			require.NoError(t, vfs.WriteFile("file1.tmp", []byte("hello"), 0777))
+			require.NoError(t, vfs.Rename("file1.tmp", "file1"))
+
+			vfs.WaitForWriters(waitForWritersDelay)
+			entries, err := r.Fremote.List(ctx, "")
+			require.NoError(t, err)
+			assert.Len(t, entries, want, "entries %v", entries)
+			for _, entry := range entries {
+				if entry.Remote() == "file1" {
+					assert.Equal(t, int64(5), entry.Size())
+				} else {
+					assert.Equal(t, int64(25), entry.Size())
+				}
+			}
+		})
 	}
 }

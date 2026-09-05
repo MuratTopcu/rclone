@@ -229,6 +229,39 @@ Note that if you change the value of this flag, the fingerprints of
 the files in the cache may be invalidated and the files will need to
 be downloaded again.
 
+### VFS Conflict Copy
+
+If a file is modified locally while a different version of it is
+written to the remote (by another computer, say), the VFS uploads the
+local version over it when the file is closed and the remote changes
+are lost.
+
+With `--vfs-conflict-copy` rclone checks the remote just before the
+upload. If the remote file has changed since it was cached, it is
+moved aside first and the local version is uploaded under the
+original name. Saving a file by writing a new file and renaming it
+over the original, as many editors do, counts as modifying the
+original. Changes are detected with the fingerprint described above,
+so this only applies to files uploaded from the VFS cache and has no
+effect with `--vfs-cache-mode off`.
+
+The check isn't atomic, so a remote change made while the upload is
+running is still overwritten, as is a remote change to a file which an
+already uploaded file is renamed over.
+
+The copy is named with `--vfs-conflict-suffix`, which defaults to
+`.conflict-{20060102-150405}` and expands time globs like bisync's
+`--conflict-suffix`, for example `report.docx.conflict-20260905-204800`.
+`--suffix-keep-extension` is honoured, giving
+`report.conflict-20260905-204800.docx`, and a number is added if a file
+of that name exists already. The copy is placed next to the original,
+or in `--backup-dir` if that is set, and appears in the mount when the
+directory is next read.
+
+This needs a remote which supports server-side move or copy. If it
+doesn't, rclone logs an error at startup and doesn't make conflict
+copies.
+
 ### VFS Chunked Reading
 
 When rclone reads files from a remote it reads them in chunks. This

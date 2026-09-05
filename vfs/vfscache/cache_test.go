@@ -12,6 +12,7 @@ import (
 	_ "github.com/rclone/rclone/backend/local" // import the local backend
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/lib/diskusage"
 	"github.com/rclone/rclone/vfs/vfscache/writeback"
@@ -595,7 +596,7 @@ func TestCacheRename(t *testing.T) {
 
 	// rename potato -> newPotato
 
-	require.NoError(t, c.Rename("potato", "newPotato", nil))
+	require.NoError(t, c.Rename("potato", "newPotato", nil, nil))
 	assertPathNotExist(t, osPath)
 	assertPathNotExist(t, osPathMeta)
 	assert.False(t, c.Exists("potato"))
@@ -608,7 +609,7 @@ func TestCacheRename(t *testing.T) {
 
 	// rename newPotato -> sub/newPotato
 
-	require.NoError(t, c.Rename("newPotato", "sub/newPotato", nil))
+	require.NoError(t, c.Rename("newPotato", "sub/newPotato", nil, nil))
 	assertPathNotExist(t, osPath)
 	assertPathNotExist(t, osPathMeta)
 	assert.False(t, c.Exists("potato"))
@@ -627,7 +628,7 @@ func TestCacheRename(t *testing.T) {
 	assert.False(t, c.Exists("sub/newPotato"))
 
 	// nonexistent file - is ignored
-	assert.NoError(t, c.Rename("nonexist", "nonexist2", nil))
+	assert.NoError(t, c.Rename("nonexist", "nonexist2", nil, nil))
 }
 
 func TestCacheCleaner(t *testing.T) {
@@ -783,4 +784,31 @@ func TestCacheQueueSetExpiry(t *testing.T) {
 	// writeback.
 	err := c.QueueSetExpiry(123123, time.Now(), 0)
 	assert.Equal(t, writeback.ErrorIDNotFound, err)
+}
+
+// TestCacheConflictCopyCheck checks that --vfs-conflict-copy is disabled
+// at startup if it can't work, rather than failing writebacks at the first
+// conflict.
+func TestCacheConflictCopyCheck(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		suffix string
+		want   bool
+	}{
+		{name: "Default", suffix: vfscommon.Opt.ConflictSuffix, want: true},
+		{name: "Empty", suffix: "", want: false},
+		{name: "Slash", suffix: ".conflict/{20060102}", want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			opt := vfscommon.Opt
+			opt.CachePollInterval = 0
+			opt.ConflictCopy = true
+			opt.ConflictSuffix = test.suffix
+			r, c := newTestCacheOpt(t, opt)
+			if test.want && !operations.CanServerSideMove(r.Fremote) {
+				t.Skip("can't keep conflict copies without server-side move")
+			}
+			assert.Equal(t, test.want, c.opt.ConflictCopy)
+		})
+	}
 }
