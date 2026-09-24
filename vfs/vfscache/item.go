@@ -644,7 +644,14 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 	// Object has disappeared if cacheObj == nil
 	if cacheObj != nil {
 		o, name := item.o, item.name
+		fingerprint := item.info.Fingerprint
 		unlockMutexForCall(&item.mu, func() {
+			if item.c.conflictCopy {
+				o, err = item.c.backupConflict(ctx, name, fingerprint)
+				if err != nil {
+					return
+				}
+			}
 			o, err = operations.Copy(ctx, item.c.fremote, o, name, cacheObj)
 		})
 		if err != nil {
@@ -668,6 +675,11 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 		item.mu.Unlock()
 		storeFn(o)
 		item.mu.Lock()
+		// storeFn may set the modification time of the object, which
+		// --vfs-conflict-copy mustn't take for a remote change
+		if item.c.conflictCopy {
+			item._updateFingerprint()
+		}
 	}
 
 	// Show item is clean and is eligible for cache removal
@@ -918,7 +930,7 @@ func (item *Item) _checkObject(o fs.Object) error {
 					fs.Debugf(item.name, "vfs cache: remote object has changed but local object modified - keeping it (remote fingerprint %q != cached fingerprint %q)", remoteFingerprint, item.info.Fingerprint)
 				}
 			}
-		} else {
+		} else if !item._keepFingerprint() {
 			// remote object && no local object
 			// Set fingerprint
 			item.info.Fingerprint = remoteFingerprint
@@ -939,7 +951,9 @@ func (item *Item) _checkObject(o fs.Object) error {
 func (item *Item) WrittenBack() bool {
 	item.mu.Lock()
 	defer item.mu.Unlock()
-	return item.info.Fingerprint != ""
+	// A kept fingerprint may be that of the file the item was renamed
+	// over, so it doesn't show the item has been written back
+	return item.info.Fingerprint != "" && !item._keepFingerprint()
 }
 
 // remove the cached file
@@ -1321,6 +1335,15 @@ func (item *Item) _updateFingerprint() {
 	}
 }
 
+// _keepFingerprint returns true if the fingerprint must only change when
+// the item is uploaded, because --vfs-conflict-copy compares it with the
+// remote to find changes made while the item is dirty.
+//
+// Call with the lock held
+func (item *Item) _keepFingerprint() bool {
+	return item.c.conflictCopy && item.info.Dirty
+}
+
 // setModTime of the cache file
 //
 // call with lock held
@@ -1337,7 +1360,9 @@ func (item *Item) _setModTime(modTime time.Time) {
 func (item *Item) setModTime(modTime time.Time) {
 	// defer log.Trace(item.name, "modTime=%v", modTime)("")
 	item.mu.Lock()
-	item._updateFingerprint()
+	if !item._keepFingerprint() {
+		item._updateFingerprint()
+	}
 	item._setModTime(modTime)
 	item.info.ModTime = modTime
 	err := item._save()
@@ -1534,7 +1559,9 @@ func (item *Item) Sync() (err error) {
 }
 
 // rename the item
-func (item *Item) rename(name string, newName string, newObj fs.Object) (err error) {
+//
+// If fingerprint is set the item replaces a file with that fingerprint.
+func (item *Item) rename(name string, newName string, newObj fs.Object, fingerprint string) (err error) {
 	item.preAccess()
 	defer item.postAccess()
 	item.mu.Lock()
@@ -1549,7 +1576,11 @@ func (item *Item) rename(name string, newName string, newObj fs.Object) (err err
 	// Set internal state
 	item.name = newName
 	item.o = newObj
-	item._updateFingerprint()
+	if fingerprint != "" {
+		item.info.Fingerprint = fingerprint
+	} else if !item._keepFingerprint() {
+		item._updateFingerprint()
+	}
 
 	// Rename cache file if it exists
 	err = rename(item.c.toOSPath(name), item.c.toOSPath(newName)) // No locking in Cache
@@ -1558,6 +1589,14 @@ func (item *Item) rename(name string, newName string, newObj fs.Object) (err err
 	err2 := rename(item.c.toOSPathMeta(name), item.c.toOSPathMeta(newName)) // No locking in Cache
 	if err2 != nil {
 		err = err2
+	}
+
+	// Keep the fingerprint of the replaced file over a restart
+	if fingerprint != "" {
+		err2 = item._save()
+		if err2 != nil {
+			err = err2
+		}
 	}
 
 	item.mu.Unlock()

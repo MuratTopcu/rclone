@@ -584,6 +584,8 @@ backends:
    oneonly:  true
    ignore:
      - TestApplyTransforms
+     # Moving a file changes its modification time
+     - TestRWConflictCopyDirRenameOver
    ignoretests:
      - cmd/bisync
  - backend:  "seafile"
