@@ -760,3 +760,21 @@ func TestWriteBackCancelUpload(t *testing.T) {
 	checkInLookup(t, wb, wbItem)
 	assert.True(t, pi.cancelled)
 }
+
+// TestWriteBackRenameOver checks that renaming a file which isn't being
+// written back over one which is removes the upload of the file it
+// replaces.
+func TestWriteBackRenameOver(t *testing.T) {
+	wb, cancel := newTestWriteBack(t)
+	defer cancel()
+
+	pi := newPutItem(t)
+	id := wb.Add(0, "one", 10, true, pi.put)
+	wbItem := wb.lookup[id]
+	checkInLookup(t, wb, wbItem)
+
+	// rename a file which isn't being written back to "one"
+	wb.Rename(id+1, "one")
+	checkNotOnHeap(t, wb, wbItem)
+	checkNotInLookup(t, wb, wbItem)
+}

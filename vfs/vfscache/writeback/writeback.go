@@ -311,10 +311,18 @@ func (wb *WriteBack) Remove(id Handle) (found bool) {
 
 // Rename should be called when a file might be uploading and it gains
 // a new name. This will cancel the upload and put it back in the
-// queue.
+// queue. Any upload of the file it replaces is removed.
 func (wb *WriteBack) Rename(id Handle, name string) {
 	wb.mu.Lock()
 	defer wb.mu.Unlock()
+
+	// Check to see if there are any uploads with the existing
+	// name and remove them
+	for existingID, existingItem := range wb.lookup {
+		if existingID != id && existingItem.name == name {
+			wb._remove(existingID)
+		}
+	}
 
 	wbItem, ok := wb.lookup[id]
 	if !ok {
@@ -323,14 +331,6 @@ func (wb *WriteBack) Rename(id Handle, name string) {
 	if wbItem.uploading {
 		// We are uploading already so cancel the upload
 		wb._cancelUpload(wbItem)
-	}
-
-	// Check to see if there are any uploads with the existing
-	// name and remove them
-	for existingID, existingItem := range wb.lookup {
-		if existingID != id && existingItem.name == name {
-			wb._remove(existingID)
-		}
 	}
 
 	wbItem.name = name

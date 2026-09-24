@@ -12,6 +12,8 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fstest"
+	"github.com/rclone/rclone/lib/random"
+	"github.com/rclone/rclone/lib/ranges"
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -713,6 +715,53 @@ func TestRWCacheRename(t *testing.T) {
 
 	assert.False(t, vfs.cache.Exists("rename_me"))
 	assert.True(t, vfs.cache.Exists("i_was_renamed"))
+}
+
+// TestRWCacheRenameOverUpload checks that renaming a file over one which
+// is waiting to be uploaded stops that upload, which would otherwise send
+// the cache file of the renamed file, only partly downloaded here.
+func TestRWCacheRenameOverUpload(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CacheMode = vfscommon.CacheModeFull
+	opt.WriteBack = fs.Duration(time.Second)
+	opt.HandleCaching = 0
+	r, vfs := newTestVFSOpt(t, &opt)
+
+	if !operations.CanServerSideMove(r.Fremote) {
+		t.Skip("skip as can't rename files")
+	}
+	const size = 4 << 20
+	if *fstest.SizeLimit > 0 && size > *fstest.SizeLimit {
+		t.Skipf("exceeded file size limit %d > %d", size, *fstest.SizeLimit)
+	}
+	ctx := context.Background()
+
+	contents := random.String(size)
+	r.WriteObject(ctx, "fileA", contents, t1)
+	r.WriteObject(ctx, "fileB", "original", t1)
+
+	fd, err := vfs.OpenFile("fileA", os.O_RDONLY, 0)
+	require.NoError(t, err)
+	_, err = fd.Read(make([]byte, 16))
+	require.NoError(t, err)
+	require.NoError(t, fd.Close())
+	require.False(t, vfs.cache.Item("fileA").HasRange(ranges.Range{Pos: 0, Size: size}), "fileA was cached completely")
+
+	require.NoError(t, vfs.WriteFile("fileB", []byte("modified"), 0777))
+	require.NoError(t, vfs.Rename("fileA", "fileB"))
+
+	require.Eventually(t, func() bool {
+		stats := vfs.cache.Stats()
+		return stats["uploadsInProgress"] == 0 && stats["uploadsQueued"] == 0
+	}, waitForWritersDelay, 10*time.Millisecond)
+	o, err := r.Fremote.NewObject(ctx, "fileB")
+	require.NoError(t, err)
+	in, err := o.Open(ctx)
+	require.NoError(t, err)
+	got, err := io.ReadAll(in)
+	require.NoError(t, err)
+	require.NoError(t, in.Close())
+	assert.True(t, string(got) == contents, "fileB was corrupted on the remote")
 }
 
 // Test the cache reading a file that is updated externally
