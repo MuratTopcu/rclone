@@ -146,6 +146,16 @@ var OptionsInfo = fs.Options{{
 	Help:    "Use fast (less accurate) fingerprints for change detection",
 	Groups:  "VFS",
 }, {
+	Name:    "vfs_conflict_copy",
+	Default: false,
+	Help:    "Keep a copy of the remote file if it changed while a local modification was pending",
+	Groups:  "VFS",
+}, {
+	Name:    "vfs_conflict_suffix",
+	Default: ".conflict-{20060102-150405}",
+	Help:    "Suffix for conflict copies, time globs are expanded",
+	Groups:  "VFS",
+}, {
 	Name:    "vfs_disk_space_total_size",
 	Default: fs.SizeSuffix(-1),
 	Help:    "Specify the total space of disk",
@@ -213,6 +223,8 @@ type Options struct {
 	ReadAhead          fs.SizeSuffix `config:"vfs_read_ahead"`       // bytes to read ahead in cache mode "full"
 	UsedIsSize         bool          `config:"vfs_used_is_size"`     // if true, use the `rclone size` algorithm for Used size
 	FastFingerprint    bool          `config:"vfs_fast_fingerprint"` // if set use fast fingerprints
+	ConflictCopy       bool          `config:"vfs_conflict_copy"`    // if set keep a copy of a remote object changed during a local modification
+	ConflictSuffix     string        `config:"vfs_conflict_suffix"`  // suffix for conflict copies, time globs are expanded
 	DiskSpaceTotalSize fs.SizeSuffix `config:"vfs_disk_space_total_size"`
 	HandleCaching      fs.Duration   `config:"vfs_handle_caching"`     // time to keep handle alive after last close
 	MetadataExtension  string        `config:"vfs_metadata_extension"` // if set respond to files with this extension with metadata
