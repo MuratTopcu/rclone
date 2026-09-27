@@ -25,6 +25,7 @@ import (
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/file"
 	"github.com/rclone/rclone/lib/systemd"
+	"github.com/rclone/rclone/lib/transform"
 	"github.com/rclone/rclone/vfs/vfscache/writeback"
 	"github.com/rclone/rclone/vfs/vfscommon"
 )
@@ -41,17 +42,18 @@ import (
 // Cache opened files
 type Cache struct {
 	// read only - no locking needed to read these
-	ctx        context.Context      // context for cache lifetime
-	fremote    fs.Fs                // fs for the remote we are caching
-	fcache     fs.Fs                // fs for the cache directory
-	fcacheMeta fs.Fs                // fs for the cache metadata directory
-	opt        *vfscommon.Options   // vfs Options
-	root       string               // root of the cache directory
-	metaRoot   string               // root of the cache metadata directory
-	hashType   hash.Type            // hash to use locally and remotely
-	hashOption *fs.HashesOption     // corresponding OpenOption
-	writeback  *writeback.WriteBack // holds Items for writeback
-	avFn       AddVirtualFn         // if set, can be called to add dir entries
+	ctx          context.Context      // context for cache lifetime
+	fremote      fs.Fs                // fs for the remote we are caching
+	fcache       fs.Fs                // fs for the cache directory
+	fcacheMeta   fs.Fs                // fs for the cache metadata directory
+	opt          *vfscommon.Options   // vfs Options
+	root         string               // root of the cache directory
+	metaRoot     string               // root of the cache metadata directory
+	hashType     hash.Type            // hash to use locally and remotely
+	hashOption   *fs.HashesOption     // corresponding OpenOption
+	writeback    *writeback.WriteBack // holds Items for writeback
+	avFn         AddVirtualFn         // if set, can be called to add dir entries
+	conflictCopy bool                 // set if --vfs-conflict-copy is in use
 
 	mu            sync.Mutex       // protects the following variables
 	cond          sync.Cond        // cond lock for synchronous cache cleaning
@@ -130,6 +132,16 @@ func New(ctx context.Context, fremote fs.Fs, opt *vfscommon.Options, avFn AddVir
 		hashOption: hashOption,
 		writeback:  writeback.New(ctx, opt),
 		avFn:       avFn,
+	}
+
+	// Check --vfs-conflict-copy can work now rather than failing
+	// writebacks at the first conflict
+	if opt.ConflictCopy {
+		if err := c.checkConflictCopy(ctx); err != nil {
+			fs.Errorf(nil, "vfs cache: disabling --vfs-conflict-copy: %v", err)
+		} else {
+			c.conflictCopy = true
+		}
 	}
 
 	// load in the cache and metadata off disk
@@ -418,9 +430,22 @@ func rename(osOldPath, osNewPath string) error {
 }
 
 // Rename the item in cache
-func (c *Cache) Rename(name string, newName string, newObj fs.Object) (err error) {
+//
+// newObj is the renamed remote object, or nil if the item hasn't been
+// uploaded. replaced is the object of the file called newName which the
+// item replaces, if any, and is only used if newObj is nil.
+func (c *Cache) Rename(name string, newName string, newObj, replaced fs.Object) (err error) {
+	var fingerprint string
+	if c.conflictCopy && newObj == nil {
+		fingerprint = c.replacedFingerprint(newName, replaced)
+	}
+	return c.renameItem(name, newName, newObj, fingerprint)
+}
+
+// renameItem renames the item in cache, giving it fingerprint if set
+func (c *Cache) renameItem(name string, newName string, newObj fs.Object, fingerprint string) (err error) {
 	item, _ := c.get(name)
-	err = item.rename(name, newName, newObj)
+	err = item.rename(name, newName, newObj, fingerprint)
 	if err != nil {
 		return err
 	}
@@ -435,6 +460,105 @@ func (c *Cache) Rename(name string, newName string, newObj fs.Object) (err error
 
 	fs.Infof(name, "vfs cache: renamed in cache to %q", newName)
 	return nil
+}
+
+// replacedFingerprint returns the fingerprint to compare the remote with
+// for an item replacing the file called name whose object is o: the one
+// that file was modified from if it is dirty, else that of o if any.
+func (c *Cache) replacedFingerprint(name string, o fs.Object) string {
+	c.mu.Lock()
+	item := c.item[name]
+	c.mu.Unlock()
+	if item != nil {
+		item.mu.Lock()
+		dirty, fingerprint := item.info.Dirty, item.info.Fingerprint
+		item.mu.Unlock()
+		if dirty {
+			return fingerprint
+		}
+	}
+	if o == nil {
+		return ""
+	}
+	return fs.Fingerprint(c.ctx, o, c.opt.FastFingerprint)
+}
+
+// backupConflict moves the remote object aside if it changed since it was
+// cached, so a pending local modification does not silently overwrite it.
+//
+// It returns the remote object the writeback should overwrite, or nil if
+// there is none because the remote doesn't exist or has just been moved
+// aside.
+func (c *Cache) backupConflict(ctx context.Context, name, fingerprint string) (fs.Object, error) {
+	remote, err := c.fremote.NewObject(ctx, name)
+	if errors.Is(err, fs.ErrorObjectNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to check remote before writeback: %w", err)
+	}
+	if fs.Fingerprint(ctx, remote, c.opt.FastFingerprint) == fingerprint {
+		return remote, nil
+	}
+	ctx, backupDir, err := c.conflictBackupDir(ctx, name)
+	if err == nil {
+		err = numberConflictCopy(ctx, backupDir, name)
+	}
+	if err == nil {
+		err = operations.MoveBackupDir(ctx, backupDir, remote)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to keep conflict copy: %w", err)
+	}
+	fs.Logf(name, "vfs cache: remote changed while modified locally - kept the remote version as %q", operations.SuffixName(ctx, name))
+	return nil, nil
+}
+
+// numberConflictCopy adds a number to the suffix in ctx if needed so the
+// conflict copy of name doesn't overwrite a file in backupDir.
+func numberConflictCopy(ctx context.Context, backupDir fs.Fs, name string) error {
+	ci := fs.GetConfig(ctx)
+	suffix := ci.Suffix
+	for i := 1; ; i++ {
+		_, err := backupDir.NewObject(ctx, operations.SuffixName(ctx, name))
+		if errors.Is(err, fs.ErrorObjectNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		ci.Suffix = fmt.Sprintf("%s-%d", suffix, i)
+	}
+}
+
+// conflictBackupDir returns the directory the conflict copy of name is
+// moved into, which is --backup-dir if set, and a context whose suffix is
+// --vfs-conflict-suffix with its time globs expanded.
+func (c *Cache) conflictBackupDir(ctx context.Context, name string) (context.Context, fs.Fs, error) {
+	ctx, ci := fs.AddConfig(ctx)
+	ci.Suffix = transform.AppyTimeGlobs(c.opt.ConflictSuffix, time.Now())
+	backupDir, err := operations.BackupDir(ctx, c.fremote, c.fremote, name)
+	return ctx, backupDir, err
+}
+
+// checkConflictCopy returns an error if --vfs-conflict-copy can't work
+// with this remote and options.
+func (c *Cache) checkConflictCopy(ctx context.Context) error {
+	if c.opt.ConflictSuffix == "" || strings.Contains(c.opt.ConflictSuffix, "/") {
+		return fmt.Errorf("invalid --vfs-conflict-suffix %q", c.opt.ConflictSuffix)
+	}
+	if !operations.CanServerSideMove(c.fremote) {
+		return errors.New("remote can't move or copy files server-side")
+	}
+	// Any file name will do as it only chooses the checks made for a
+	// single file
+	_, _, err := c.conflictBackupDir(ctx, "file")
+	return err
+}
+
+// ConflictCopy returns true if --vfs-conflict-copy is in use.
+func (c *Cache) ConflictCopy() bool {
+	return c.conflictCopy
 }
 
 // DirExists checks to see if the directory exists in the cache or not.
@@ -467,7 +591,7 @@ func (c *Cache) DirRename(oldDirName string, newDirName string) (err error) {
 	// Rename the items
 	for _, itemName := range renames {
 		newPath := newDirName + itemName[len(oldDirName):]
-		renameErr := c.Rename(itemName, newPath, nil)
+		renameErr := c.renameItem(itemName, newPath, nil, "")
 		if renameErr != nil {
 			err = renameErr
 		}

@@ -241,9 +241,14 @@ backends:
      # This test doesn't work on a standard Onedrive account returning
      # accessDenied: accountUpgradeRequired: Account Upgrade is required for this operation.
      - TestIntegration/FsMkdir/FsPutFiles/PublicLink
+     # A directory can't be removed straight after moving files out of it
+     - TestRWConflictCopyDirRenameOver
  - backend:  "onedrive"
    remote:   "TestOneDriveBusiness:"
    fastlist: false
+   ignore:
+     # A directory can't be removed straight after moving files out of it
+     - TestRWConflictCopyDirRenameOver
  # - backend:  "onedrive"
  #   remote:   "TestOneDriveCn:"
  #   fastlist: false
@@ -584,6 +589,8 @@ backends:
    oneonly:  true
    ignore:
      - TestApplyTransforms
+     # Moving a file changes its modification time
+     - TestRWConflictCopyDirRenameOver
    ignoretests:
      - cmd/bisync
  - backend:  "seafile"

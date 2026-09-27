@@ -190,6 +190,21 @@ func TestVFSNewShuttingDown(t *testing.T) {
 	vfs2.Shutdown()
 }
 
+// TestVFSNewConflictCopyDisabled checks that a VFS whose cache disabled
+// --vfs-conflict-copy at startup is still reused for the same options.
+func TestVFSNewConflictCopyDisabled(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CacheMode = vfscommon.CacheModeWrites
+	opt.ConflictCopy = true
+	opt.ConflictSuffix = "invalid/suffix"
+	r, vfs := newTestVFSOpt(t, &opt)
+	require.False(t, vfs.cache.ConflictCopy())
+
+	vfs2 := New(context.Background(), r.Fremote, &opt)
+	defer vfs2.Shutdown()
+	assert.Same(t, vfs, vfs2)
+}
+
 // TestVFSNewWithOpts sees if the New command works properly
 func TestVFSNewWithOpts(t *testing.T) {
 	var opt = vfscommon.Opt

@@ -274,7 +274,16 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
 		}
 		// Rename in the cache
 		if d.vfs.cache != nil && d.vfs.cache.Exists(oldPath) {
-			if err := d.vfs.cache.Rename(oldPath, newPath, newObject); err != nil {
+			// Editors save by renaming a new file over the original,
+			// so with --vfs-conflict-copy writeback compares the
+			// remote with the file as the VFS saw it
+			var replaced fs.Object
+			if o == nil && d.vfs.cache.ConflictCopy() {
+				if dst, ok := d.cachedNode(newName).(*File); ok && dst != f {
+					replaced = dst.getObject()
+				}
+			}
+			if err := d.vfs.cache.Rename(oldPath, newPath, newObject, replaced); err != nil {
 				fs.Infof(f.Path(), "File.Rename failed in Cache: %v", err)
 			}
 		}
@@ -464,6 +473,10 @@ func (f *File) SetModTime(modTime time.Time) error {
 
 	// Only update the ModTime when there are no writers, setObject will do it
 	if !f._writingInProgress() {
+		if f._keepRemoteModTime() {
+			f.pendingModTime = time.Time{}
+			return nil
+		}
 		return f._applyPendingModTime()
 	}
 
@@ -509,7 +522,20 @@ func (f *File) _applyPendingModTime() error {
 func (f *File) applyPendingModTime() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f._keepRemoteModTime() {
+		f.pendingModTime = time.Time{}
+		return nil
+	}
 	return f._applyPendingModTime()
+}
+
+// _keepRemoteModTime returns true if a pending modification time mustn't
+// be applied to the remote object, as --vfs-conflict-copy would take it
+// for a remote change. The pending upload carries the time instead.
+//
+// Call with read lock held
+func (f *File) _keepRemoteModTime() bool {
+	return f.d.vfs.cache != nil && f.d.vfs.cache.ConflictCopy() && f.d.vfs.cache.DirtyItem(f._cachePath()) != nil
 }
 
 // _writingInProgress returns true of there are any open writers
